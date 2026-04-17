@@ -53,6 +53,10 @@ def clean_final_text(text):
     if not text:
         return None
 
+    # 0. Удаляем HTML/Unity rich-text теги: <color=#...>, </color>, <b>, </b> и т.п.
+    #    Не трогаем наши теги-якоря (<PLAYER>, <CHAR_Lilith>, <SCENE>, <NPC_...>)
+    text = re.sub(r'</?(?:color|b|i|size|material|quad)[^>]*>', '', text)
+
     # 1. Удаляем любые квадратные скобки, внутри которых есть технические символы:
     # =, /, {, }, ", а также специфические слова (important, lock, if)
     # Это уберет [lock if = {0} /], [important /], [char ... /]

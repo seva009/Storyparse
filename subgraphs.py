@@ -9,7 +9,8 @@ def find_valid_subgraphs(graph, translation):
     subgraphs = []
 
     # Заранее отбираем только нужные типы нод
-    valid_nodes = {n for n, t in node_type.items() if t in (0, 1, 2)}
+    # Тип 3 = NPC — включаем, чтобы сцены с NPC+Лилит не обрезались
+    valid_nodes = {n for n, t in node_type.items() if t in (0, 1, 2, 3)}
 
     for node in valid_nodes:
         if node in visited:
@@ -111,56 +112,36 @@ def analyze_subgraph_duplicates(subgraphs):
 
     return percent_unique
 
-from tqdm import tqdm
-import sys
-
 def extract_paths_from_subgraph(subgraph, max_depth=2000):
     sg_nodes = set(subgraph)
     all_paths = []
 
-    # Определяем точки входа
     start_nodes = [n for n in subgraph if not (n.parents & sg_nodes)]
     if not start_nodes:
         start_nodes = [subgraph[0]]
 
-    # Создаем общий прогресс-бар для найденных путей
-    # Так как мы не знаем финала, будем просто считать количество
-    pbar = tqdm(total=len(start_nodes), desc="Processing Start Nodes", unit="node")
-
-    def dfs(node, path, visited_set, depth):
+    def dfs(node, path, depth):
         if depth > max_depth:
             all_paths.append(list(path))
+            #print(f"[DFS] Max depth reached at node {node.id}, path length: {len(path)}")
             return
 
         children = [c for c in node.children if c in sg_nodes]
 
         if not children:
             all_paths.append(list(path))
-            # Обновляем инфо в баре, чтобы видеть, что процесс идет
-            if len(all_paths) % 100 == 0:
-                pbar.set_postfix({"paths_found": len(all_paths)})
+            #print(f"[DFS] Leaf node {node.id}, path length: {len(path)}")
             return
 
         for child in children:
-            if child.id in visited_set:
-                # Убираем спам в консоль, чтобы не тормозить процесс
-                # Если очень нужно видеть циклы, лучше писать в файл
+            if child.id in path:  # цикл
+                print(f"[DFS] Skipping cycle at {child.id}")
                 continue
-            
-            visited_set.add(child.id)
-            path.append(child.id)
-            
-            dfs(child, path, visited_set, depth + 1)
-            
-            path.pop()
-            visited_set.remove(child.id)
+            dfs(child, path + [child.id], depth + 1)
 
     for start in start_nodes:
-        dfs(start, [start.id], {start.id}, 1)
-        pbar.update(1) # Завершили один стартовый узел
+        dfs(start, [start.id], 1)
 
-    pbar.close()
-    print(f"Done! Total paths: {len(all_paths)}")
     return all_paths
 
 def extract_all_paths(subgraphs):
