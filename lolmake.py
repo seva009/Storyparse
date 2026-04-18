@@ -123,6 +123,13 @@ BG_SCENES = {
     },
 }
 
+# Localized label for choice lists
+CHOICES_PROMPT = {
+    'ru': 'Доступные варианты выбора',
+    'en': 'Available choices',
+    'zh': '可选项',
+}
+
 # ─────────────────────────────────────────────────────────────
 #  YARN METADATA
 # ─────────────────────────────────────────────────────────────
@@ -180,7 +187,10 @@ def classify_speaker(en_text):
 
 
 def format_message(sp_type, text, emotion_id=None, lang='ru'):
+    if sp_type == 'SYSTEM':
+        return f'<SYSTEM_NOTE> {text} </SYSTEM_NOTE>'
     if sp_type == 'YOU':
+        text = tag_choice_made(text)
         return f'<PLAYER> {text}'
     if sp_type == 'LILITH':
         emo = LILITH_EMOTIONS.get(lang, {}).get(emotion_id) if emotion_id is not None else None
@@ -188,8 +198,107 @@ def format_message(sp_type, text, emotion_id=None, lang='ru'):
             return f'<CHAR_Lilith> *{emo}* {text}'
         return f'<CHAR_Lilith> {text}'
     if sp_type == 'THOUGHT':
+        text = tag_choice_made(text)
         return f'<PLAYER> *{text}*'
     return f'<{sp_type}> {text}'   # NPC_Kallen, NPC_Crowd
+
+
+CHOICE_MADE_OPEN = '<CHOICE_MADE>'
+CHOICE_MADE_CLOSE = '</CHOICE_MADE>'
+CHOICE_MADE_RE = re.compile(r'^\s*(\[[^\]\n]{1,200}\])(\s*.*)$', re.DOTALL)
+CHOICE_OPTION_LINE_RE = re.compile(
+    r'^(?P<prefix>\s*)(?P<option>[^\|\n]{1,80})\s*\|\s*(?P<desc>[^\n]{1,200})(?P<suffix>\s*)$'
+)
+
+
+def _is_choice_node(node_text: str, en_text: str) -> bool:
+    nt = (node_text or '').lstrip()
+    et = (en_text or '').lstrip()
+    return nt.startswith('->') or et.startswith('->')
+
+
+def _choice_display_text(cleaned_text: str) -> str:
+    """Turn a cleaned choice line into human-display text."""
+    s = (cleaned_text or '').strip()
+    if s.startswith('->'):
+        s = s[2:].strip()
+    return s
+
+
+def _choice_short_label(display_text: str) -> str:
+    """Prefer the part before '|' as a short label."""
+    s = (display_text or '').strip()
+    if '|' in s:
+        return s.split('|', 1)[0].strip()
+    return s
+
+
+def _fallback_choice_label_from_node_text(node_text: str) -> str:
+    """
+    Extract label from raw yarn choice node text like:
+      '-> Accept|Take it. #line:abc123'
+    """
+    if not node_text:
+        return ''
+    s = node_text.strip()
+    if s.startswith('->'):
+        s = s[2:].strip()
+    # remove trailing #line:...
+    s = re.sub(r'\s*#line:[0-9a-f]+\s*$', '', s).strip()
+    # prefer left side before '|'
+    return _choice_short_label(s)
+
+
+def _is_ancestor(ancestor, node, max_visits: int = 3000) -> bool:
+    """Check if `ancestor` is in the parent chain of `node`."""
+    if ancestor is node:
+        return True
+    seen = set()
+    stack = list(getattr(node, 'parents', []) or [])
+    visits = 0
+    while stack and visits < max_visits:
+        cur = stack.pop()
+        visits += 1
+        if cur is ancestor:
+            return True
+        if cur in seen:
+            continue
+        seen.add(cur)
+        stack.extend(list(getattr(cur, 'parents', []) or []))
+    return False
+
+
+def tag_choice_made(text: str) -> str:
+    """
+    If a player's message starts with a bracketed choice like "[Accept gift]",
+    wrap that bracketed segment with <CHOICE_MADE> ... </CHOICE_MADE>.
+    """
+    if not text:
+        return text
+    if CHOICE_MADE_OPEN in text or CHOICE_MADE_CLOSE in text:
+        return text
+    # 1) Explicit "[...]" at the very start (player picked option shown in brackets).
+    m = CHOICE_MADE_RE.match(text)
+    if m:
+        bracketed, rest = m.group(1), m.group(2) or ''
+        return f'{CHOICE_MADE_OPEN} {bracketed} {CHOICE_MADE_CLOSE}{rest}'
+
+    # 2) Yarn-style option lines like "Pay|Give 500 gold." possibly inside multiline text.
+    lines = text.splitlines(True)  # keepends
+    for idx, raw_line in enumerate(lines):
+        line = raw_line[:-1] if raw_line.endswith('\n') else raw_line
+        m2 = CHOICE_OPTION_LINE_RE.match(line)
+        if not m2:
+            continue
+        wrapped_line = (
+            f"{m2.group('prefix')}{CHOICE_MADE_OPEN} "
+            f"{m2.group('option').strip()}|{m2.group('desc').strip()} "
+            f"{CHOICE_MADE_CLOSE}{m2.group('suffix')}"
+        )
+        lines[idx] = wrapped_line + ('\n' if raw_line.endswith('\n') else '')
+        return ''.join(lines)
+
+    return text
 
 
 # ─────────────────────────────────────────────────────────────
@@ -277,6 +386,54 @@ def topological_sequence(component):
     return seq
 
 
+def walk_sequence(component, prefer: str = 'min'):
+    """
+    Deterministic walk along graph edges inside the component.
+    This avoids mixing unrelated branches (which can happen in topo order).
+    """
+    comp_set = set(component)
+
+    # Prefer a "root" (no parents inside component), else smallest id.
+    roots = [n for n in comp_set if not any(p in comp_set for p in n.parents)]
+    cur = min(roots, key=lambda x: x.id) if roots else min(comp_set, key=lambda x: x.id)
+
+    seq = []
+    seen = set()
+
+    while cur and cur in comp_set and cur not in seen:
+        seen.add(cur)
+        seq.append(cur)
+
+        kids = [c for c in cur.children if c in comp_set and c not in seen]
+        if not kids:
+            break
+
+        # Deterministic edge choice: smallest, middle, largest id, or select
+        # by numeric index if prefer is an integer (as string or int).
+        if prefer == 'max':
+            cur = max(kids, key=lambda x: x.id)
+        elif prefer == 'mid':
+            # middle by sorted id order (use integer division)
+            sorted_kids = sorted(kids, key=lambda x: x.id)
+            cur = sorted_kids[len(sorted_kids) // 2]
+        else:
+            # numeric prefer: choose the child at that index when possible
+            try:
+                idx = int(prefer)
+            except Exception:
+                idx = None
+            if idx is not None:
+                sorted_kids = sorted(kids, key=lambda x: x.id)
+                if 0 <= idx < len(sorted_kids):
+                    cur = sorted_kids[idx]
+                else:
+                    cur = min(kids, key=lambda x: x.id)
+            else:
+                cur = min(kids, key=lambda x: x.id)
+
+    return seq
+
+
 # ─────────────────────────────────────────────────────────────
 #  СБОРКА SPEAKER-БЛОКОВ из линейной последовательности
 # ─────────────────────────────────────────────────────────────
@@ -290,19 +447,110 @@ def sequence_to_blocks(seq, translation, node_bg, node_emotion, lang):
     current = None
     last_scene = None
 
-    for node in seq:
+    i = 0
+    n = len(seq)
+    while i < n:
+        node = seq[i]
         raw_id = node.id.split(':')[-1]
         if raw_id not in translation:
+            i += 1
             continue
 
         en_text  = translation[raw_id].get('en', '')
         tgt_text = translation[raw_id].get(lang, '')
         cleaned  = clean_final_text(tgt_text)
         if not cleaned:
+            i += 1
             continue
 
-        sp_type = classify_speaker(en_text)
+        # If current node offers choices (children are '->' nodes), emit options + chosen.
+        choice_children = []
+        for ch in sorted(node.children, key=lambda x: x.id):
+            rid_ch = ch.id.split(':')[-1]
+            if rid_ch not in translation:
+                continue
+            en_ch = translation[rid_ch].get('en', '')
+            if _is_choice_node(ch.text, en_ch):
+                choice_children.append(ch)
+
+        if choice_children:
+            # Collect option labels
+            labels = []
+            for ch in choice_children:
+                rid_ch = ch.id.split(':')[-1]
+                tgt_ch = translation[rid_ch].get(lang, '')
+                # Remove any trailing #line:... markers or inline comments that
+                # may have been left in translations (e.g. "... #line:abcd //..."),
+                # then clean the display text.
+                if tgt_ch is None:
+                    tgt_ch = ''
+                # strip trailing #line: markers
+                tgt_ch = re.sub(r'\s*#line:[0-9a-fA-F]+\s*', '', tgt_ch)
+                # strip end-of-line '//' comments (common in some translations)
+                tgt_ch = re.sub(r'//.*$', '', tgt_ch).strip()
+                cleaned_ch = clean_final_text(tgt_ch)
+                disp = _choice_display_text(cleaned_ch or '')
+                lab = _choice_short_label(disp)
+                if not lab:
+                    # fallback to raw node text if translation/cleaning removed it
+                    lab = _fallback_choice_label_from_node_text(getattr(ch, 'text', ''))
+                labels.append(lab)
+
+            # Chosen option = the one that leads to the next node in our walk, if possible.
+            next_node = seq[i + 1] if (i + 1) < n else None
+            chosen_idx = 0
+            if next_node is not None:
+                for k, opt in enumerate(choice_children):
+                    if _is_ancestor(opt, next_node):
+                        chosen_idx = k
+                        break
+
+            options_txt = ', '.join([f'{idx+1}. {lab}' for idx, lab in enumerate(labels) if lab])
+            prompt = CHOICES_PROMPT.get(lang, CHOICES_PROMPT['en'])
+            sys_line = f'{prompt}: [{options_txt}]' if options_txt else prompt
+
+            if current:
+                blocks.append(current)
+                current = None
+
+            blocks.append({'role': 'SYSTEM', 'lines': [sys_line], 'scene': None, 'emotion': None})
+
+            chosen_label = labels[chosen_idx] if labels else ''
+            # Append the actual chosen option
+            if chosen_label:
+                blocks.append({'role': 'YOU', 'lines': [f'{CHOICE_MADE_OPEN} [{chosen_label}] {CHOICE_MADE_CLOSE}'], 'scene': None, 'emotion': None})
+            # Also emit examples for other listed options to increase coverage
+            # (ensures each listed option appears at least once in the dataset).
+            for idx, lab in enumerate(labels):
+                if not lab or idx == chosen_idx:
+                    continue
+                blocks.append({'role': 'YOU', 'lines': [f'{CHOICE_MADE_OPEN} [{lab}] {CHOICE_MADE_CLOSE}'], 'scene': None, 'emotion': None})
+
+        # Skip rendering choice nodes themselves (they're UI options, not narrative text)
+        if _is_choice_node(node.text, en_text):
+            i += 1
+            continue
+
+        # Use the robust classifier that checks all translations (en/ru/zh)
+        # so we prefer explicit speaker names present in any translation.
+        sp_type = classify_node(node, translation)
+        # classify_node returns numeric codes (0=THOUGHT,1=YOU,2=LILITH,3=OTHER).
+        # Convert to the string roles used elsewhere in this module.
+        if isinstance(sp_type, int):
+            if sp_type == 0:
+                sp_type = 'THOUGHT'
+            elif sp_type == 1:
+                sp_type = 'YOU'
+            elif sp_type == 2:
+                sp_type = 'LILITH'
+            else:
+                sp_type = 'NPC_Crowd'
         emotion = node_emotion.get(raw_id)
+
+        # Heuristic: if a "thought"/narration explicitly mentions Lilith, treat it as Lilith.
+        # This helps avoid cases where Lilith's untagged lines get merged into player thoughts.
+        if sp_type == 'THOUGHT' and re.search(r'\bЛилит\b', cleaned):
+            sp_type = 'LILITH'
 
         # Сцена
         bg = node_bg.get(raw_id)
@@ -331,6 +579,7 @@ def sequence_to_blocks(seq, translation, node_bg, node_emotion, lang):
                 'scene':   scene_tag if scene_changed else None,
                 'emotion': emotion,
             }
+        i += 1
 
     if current:
         blocks.append(current)
@@ -353,11 +602,57 @@ def blocks_to_examples(blocks, sys_content, lang):
 
     token_counts = [estimate_tokens('\n'.join(b['lines'])) for b in blocks]
     window_size  = find_window_size(token_counts, MAX_TOKENS)
-    step = 5 if window_size >= 20 else 1
+    step = 5 if window_size >= 20 else 2
 
     examples = []
-    for i in range(0, max(1, len(blocks) - window_size + 1), step):
-        window = blocks[i : i + window_size]
+    # If dialogue is shorter than the window, keep it as-is (single example).
+    if len(blocks) <= window_size:
+        ex = build_example(sys_content, blocks, lang)
+        if ex:
+            examples.append(ex)
+        return examples
+
+    # Otherwise, slide a fixed-size window; stop when the right edge reaches the end.
+    last_start = len(blocks) - window_size
+    i = 0
+    last_emitted_start = None
+    while i <= last_start:
+        start = i
+        end = i + window_size
+
+        # Do not split choice "pair": include SYSTEM_NOTE before CHOICE_MADE,
+        # and include CHOICE_MADE after SYSTEM_NOTE if the window ends there.
+        if start > 0:
+            b0 = blocks[start]
+            b_prev = blocks[start - 1]
+            if b0.get('role') == 'YOU' and any(CHOICE_MADE_OPEN in ln for ln in b0.get('lines', [])):
+                if b_prev.get('role') == 'SYSTEM' and any('Доступные варианты выбора' in ln for ln in b_prev.get('lines', [])):
+                    start -= 1
+        if end < len(blocks):
+            b_last = blocks[end - 1]
+            b_next = blocks[end]
+            if b_last.get('role') == 'SYSTEM' and any('Доступные варианты выбора' in ln for ln in b_last.get('lines', [])):
+                if b_next.get('role') == 'YOU' and any(CHOICE_MADE_OPEN in ln for ln in b_next.get('lines', [])):
+                    end += 1
+
+        window = blocks[start:end]
+        ex = build_example(sys_content, window, lang)
+        if ex:
+            examples.append(ex)
+            last_emitted_start = i
+        i += step
+
+    # Ensure we always include the final window that reaches the end.
+    if last_emitted_start != last_start:
+        start = last_start
+        end = last_start + window_size
+        if start > 0:
+            b0 = blocks[start]
+            b_prev = blocks[start - 1]
+            if b0.get('role') == 'YOU' and any(CHOICE_MADE_OPEN in ln for ln in b0.get('lines', [])):
+                if b_prev.get('role') == 'SYSTEM' and any('Доступные варианты выбора' in ln for ln in b_prev.get('lines', [])):
+                    start -= 1
+        window = blocks[start:end]
         ex = build_example(sys_content, window, lang)
         if ex:
             examples.append(ex)
@@ -387,6 +682,28 @@ def build_example(sys_content, blocks, lang):
             merged[-1]['content'] += '\n' + msg['content']
         else:
             merged.append(dict(msg))
+
+    # Ensure user messages have a single leading <PLAYER> tag.
+    # Remove any existing <PLAYER> occurrences inside user content and
+    # prefix the whole message once.
+    import re
+    for m in merged:
+        if m['role'] == 'user':
+            # remove all occurrences of the tag (and surrounding whitespace)
+            cleaned = re.sub(r'<PLAYER>\s*', '', m['content'])
+            cleaned = cleaned.strip()
+
+            # Process all SYSTEM_NOTE -> CHOICE_MADE adjacency cases: ensure any
+            # CHOICE_MADE immediately following a SYSTEM_NOTE is prefixed with
+            # '<PLAYER> '. Do this for all occurrences in the block.
+            lines = [ln for ln in cleaned.splitlines()]
+            for i in range(len(lines) - 1):
+                if ('<SYSTEM_NOTE>' in lines[i] and 'Доступные варианты выбора' in lines[i]) and lines[i+1].strip().startswith('<CHOICE_MADE>'):
+                    lines[i+1] = '<PLAYER> ' + lines[i+1].lstrip()
+
+            # Reconstruct body and always prefix the whole user message once.
+            body = '\n'.join([ln for ln in lines if ln.strip()])
+            m['content'] = '<PLAYER> ' + body if body else '<PLAYER>'
 
     # Заканчиваем на assistant
     while merged and merged[-1]['role'] != 'assistant':
@@ -438,11 +755,31 @@ def save_dataset(components, translation, node_bg, node_emotion,
     diag_sizes = Counter()
 
     for comp in components:
-        seq    = topological_sequence(comp)
-        blocks = sequence_to_blocks(seq, translation, node_bg, node_emotion, lang)
-        diag_sizes[len(blocks)] += 1
-        examples = blocks_to_examples(blocks, sys_content, lang)
-        dataset.extend(examples)
+        # Determine maximum number of options present at any choice point in this component
+        max_options = 0
+        comp_set = set(comp)
+        for node in comp:
+            choice_children = []
+            for ch in sorted(node.children, key=lambda x: x.id):
+                rid_ch = ch.id.split(':')[-1]
+                if rid_ch not in translation:
+                    continue
+                en_ch = translation[rid_ch].get('en', '')
+                if _is_choice_node(ch.text, en_ch):
+                    choice_children.append(ch)
+            if len(choice_children) > max_options:
+                max_options = len(choice_children)
+
+        # Build preferences: base deterministic prefs plus numeric indices to force
+        # selection of specific child positions when possible.
+        prefs = ['min', 'mid', 'max'] + [str(i) for i in range(max_options)]
+
+        for prefer in prefs:
+            seq    = walk_sequence(comp, prefer=prefer)
+            blocks = sequence_to_blocks(seq, translation, node_bg, node_emotion, lang)
+            diag_sizes[len(blocks)] += 1
+            examples = blocks_to_examples(blocks, sys_content, lang)
+            dataset.extend(examples)
 
     # Дедупликация
     unique = {json.dumps(ex, sort_keys=True, ensure_ascii=False): ex

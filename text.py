@@ -16,10 +16,15 @@ def detect_speaker(text):
 
 def normalize_speaker(speaker):
     # Убираем скобки, если они остались, и переводим в нижний регистр
-    s = speaker.replace("[", "").replace("]", "").strip().lower()
+    # Remove common bracket/quote characters that may surround the name
+    s = speaker.replace("[", "").replace("]", "")
+    s = s.replace('「', '').replace('」', '').replace('“', '').replace('”', '')
+    # Normalize some fullwidth punctuation used in CJK translations
+    s = s.replace('？', '?').replace('！', '!')
+    s = s.replace('"', '').replace("'", '').strip().lower()
     
-    if s in ["you", "player", "ты"]: return "YOU"
-    if s in ["lilith", "???", "strange girl", "莉莉丝"]: return "LILITH"
+    if s in ["you", "player", "ты", "你", "вы"]: return "YOU"
+    if s in ["lilith", "лилит","странная девушка","陌生的少女","陌生少女", "strange girl","mysterious girl","таинственная девушка", "莉莉丝"]: return "LILITH"
     if s in ["thought", "мысль", "система", "system"]: return "THOUGHT"
     
     return "OTHER"
@@ -27,14 +32,52 @@ def normalize_speaker(speaker):
 def get_node_speaker(node, translation):
     # вытаскиваем line_id
     raw_id = node.id.split(":")[-1]
+    # If we have translations, check all three languages for an explicit speaker name
+    # (the part before colon). Prefer any translation that contains a name. If
+    # multiple translations contain different speaker names, raise an error so
+    # the issue can be inspected and corrected manually.
+    raw_id = node.id.split(":")[-1]
 
+    texts = []
     if raw_id in translation:
-        text = translation[raw_id]["en"]
+        tr = translation[raw_id]
+        texts = [tr.get('en', '') or '', tr.get('ru', '') or '', tr.get('zh', '') or '']
     else:
-        text = node.text  # fallback
+        texts = [node.text or '']
 
-    speaker = detect_speaker(text)
-    return normalize_speaker(speaker)
+    candidates = []
+    langs = ['en', 'ru', 'zh']
+    for lang, txt in zip(langs, texts):
+        if not txt:
+            continue
+        sp = detect_speaker(txt)
+        # detect_speaker returns 'THOUGHT' when there's no explicit "Name:" at start
+        if sp and sp != 'THOUGHT':
+            candidates.append((lang, sp.strip()))
+
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_names = []
+    for lang, name in candidates:
+        if name not in seen:
+            seen.add(name)
+            unique_names.append((lang, name))
+
+    if not unique_names:
+        # Fallback to previous behavior (use English or node.text)
+        text = translation[raw_id]['en'] if raw_id in translation else node.text
+        speaker = detect_speaker(text)
+        return normalize_speaker(speaker)
+
+    # If multiple different explicit names found, ensure they normalize to the same speaker.
+    names_only = [n for _, n in unique_names]
+    norms = [normalize_speaker(n) for n in names_only]
+    if len(set(norms)) == 1:
+        return norms[0]
+
+    # Conflict: different names across translations -> fail fast with useful info
+    details = ", ".join([f"{lang}:'{name}'" for lang, name in unique_names])
+    raise RuntimeError(f"Speaker name conflict for node {node.id}: {details}")
 
 
 def classify_node(node, translation):
